@@ -77,7 +77,7 @@ function SessionBootstrap() {
     dispatch(sessionCleared());
   }, [dispatch]);
 
-  const { data, isSuccess, isError } = useGetCurrentUserQuery(undefined, { skip: !isAuthenticated });
+  const { data, isSuccess } = useGetCurrentUserQuery(undefined, { skip: !isAuthenticated });
 
   useEffect(() => {
     if (isSuccess && data) {
@@ -85,13 +85,6 @@ function SessionBootstrap() {
     }
   }, [isSuccess, data, dispatch]);
 
-  useEffect(() => {
-    // baseQueryWithReauth already tried a refresh before surfacing this error, so a
-    // failure here means the session is genuinely dead — log the user out cleanly.
-    if (isError) {
-      dispatch(sessionCleared());
-    }
-  }, [isError, dispatch]);
 
   return null;
 }

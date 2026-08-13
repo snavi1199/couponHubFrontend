@@ -1,73 +1,215 @@
-import { fetchBaseQuery, type BaseQueryFn, type FetchArgs, type FetchBaseQueryError } from '@reduxjs/toolkit/query';
-import { createApi } from '@reduxjs/toolkit/query/react';
-import { tokenStorage } from '@/lib/tokenStorage';
-import type { AuthResponse, ApiResponse } from '@/lib/types';
+import {
+  fetchBaseQuery,
+  type BaseQueryFn,
+  type FetchArgs,
+  type FetchBaseQueryError,
+} from '@reduxjs/toolkit/query';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080/api';
+import { createApi } from '@reduxjs/toolkit/query/react';
+
+import { tokenStorage } from '@/lib/tokenStorage';
+
+import type {
+  AuthResponse,
+  ApiResponse,
+} from '@/lib/types';
+
+import { sessionCleared } from '@/features/auth/authSlice';
+
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ??
+  'http://localhost:8080/api';
 
 const rawBaseQuery = fetchBaseQuery({
   baseUrl: API_BASE_URL,
+
   prepareHeaders: (headers) => {
-    const token = tokenStorage.getAccessToken();
-    if (token) {
-      headers.set('Authorization', `Bearer ${token}`);
+    const accessToken = tokenStorage.getAccessToken();
+
+    if (accessToken) {
+      headers.set(
+        'Authorization',
+        `Bearer ${accessToken}`
+      );
     }
-    headers.set('Content-Type', 'application/json');
+
+    headers.set(
+      'Content-Type',
+      'application/json'
+    );
+
     return headers;
   },
 });
 
-// Prevents a stampede of parallel refresh calls when several queries 401 at once.
+/*
+ * Prevent multiple simultaneous API requests from
+ * triggering multiple refresh requests.
+ */
 let refreshPromise: Promise<boolean> | null = null;
 
-/**
- * Wraps the base query: on a 401, attempts exactly one token refresh (deduped across
- * concurrent requests), then retries the original request once. If refresh itself fails,
- * clears tokens so ProtectedRoute redirects to /login.
- */
-const baseQueryWithReauth: BaseQueryFn<string | FetchArgs, unknown, FetchBaseQueryError> = async (
+const performTokenRefresh = async (
+  api: Parameters<BaseQueryFn>[1],
+  extraOptions: Parameters<BaseQueryFn>[2]
+): Promise<boolean> => {
+  const refreshToken =
+    tokenStorage.getRefreshToken();
+
+  if (!refreshToken) {
+    return false;
+  }
+
+  const refreshResult = await rawBaseQuery(
+    {
+      url: '/auth/refresh',
+      method: 'POST',
+      body: {
+        refreshToken,
+      },
+    },
+    api,
+    extraOptions
+  );
+
+  /*
+   * Refresh endpoint failed.
+   *
+   * At this point the session is genuinely invalid.
+   */
+  if (refreshResult.error) {
+    return false;
+  }
+
+  if (!refreshResult.data) {
+    return false;
+  }
+
+  const payload =
+    refreshResult.data as ApiResponse<AuthResponse>;
+
+  const newAccessToken =
+    payload.data?.accessToken;
+
+  const newRefreshToken =
+    payload.data?.refreshToken;
+
+  if (!newAccessToken) {
+    return false;
+  }
+
+  /*
+   * Some backends rotate refresh tokens.
+   *
+   * If a new refresh token is returned, store it.
+   * Otherwise preserve the existing one.
+   */
+  if (newRefreshToken) {
+    tokenStorage.setTokens(
+      newAccessToken,
+      newRefreshToken
+    );
+  } else {
+    tokenStorage.setAccessToken(
+      newAccessToken
+    );
+  }
+
+  return true;
+};
+
+const baseQueryWithReauth: BaseQueryFn<
+  string | FetchArgs,
+  unknown,
+  FetchBaseQueryError
+> = async (
   args,
   api,
   extraOptions
 ) => {
-  let result = await rawBaseQuery(args, api, extraOptions);
+  /*
+   * First attempt using the current access token.
+   */
+  let result = await rawBaseQuery(
+    args,
+    api,
+    extraOptions
+  );
 
-  // 401 is the correct "not authenticated" status from the backend (see SecurityConfig's
-  // AuthenticationEntryPoint). We also treat 403 as a trigger here defensively — some Spring
-  // Security configurations return 403 for an expired/invalid token instead of 401 — so an
-  // expired access token never gets stuck failing requests when a silent refresh would fix it.
-  if (result.error && (result.error.status === 401 || result.error.status === 403)) {
-    const refreshToken = tokenStorage.getRefreshToken();
+  /*
+   * Only authentication failures should trigger
+   * the refresh flow.
+   */
+  const shouldRefresh =
+    result.error &&
+    (
+      result.error.status === 401 ||
+      result.error.status === 403
+    );
 
-    if (!refreshToken) {
-      tokenStorage.clear();
-      return result;
-    }
+  if (!shouldRefresh) {
+    return result;
+  }
 
-    if (!refreshPromise) {
-      refreshPromise = (async () => {
-        const refreshResult = await rawBaseQuery(
-          { url: '/auth/refresh', method: 'POST', body: { refreshToken } },
-          api,
-          extraOptions
-        );
-        if (refreshResult.data) {
-          const payload = refreshResult.data as ApiResponse<AuthResponse>;
-          tokenStorage.setTokens(payload.data.accessToken, payload.data.refreshToken);
-          return true;
-        }
-        tokenStorage.clear();
-        return false;
-      })().finally(() => {
-        refreshPromise = null;
-      });
-    }
+  /*
+   * Do we have a refresh token?
+   */
+  if (!tokenStorage.getRefreshToken()) {
+    api.dispatch(sessionCleared());
 
-    const refreshed = await refreshPromise;
+    return result;
+  }
 
-    if (refreshed) {
-      result = await rawBaseQuery(args, api, extraOptions);
-    }
+  /*
+   * If another request is already refreshing,
+   * wait for that same refresh request.
+   */
+  if (!refreshPromise) {
+    refreshPromise = performTokenRefresh(
+      api,
+      extraOptions
+    ).finally(() => {
+      refreshPromise = null;
+    });
+  }
+
+  const refreshed =
+    await refreshPromise;
+
+  /*
+   * Refresh failed.
+   *
+   * Now, and only now, clear the session.
+   */
+  if (!refreshed) {
+    api.dispatch(sessionCleared());
+
+    return result;
+  }
+
+  /*
+   * Refresh succeeded.
+   *
+   * rawBaseQuery.prepareHeaders() will now pick up
+   * the NEW access token from tokenStorage.
+   */
+  result = await rawBaseQuery(
+    args,
+    api,
+    extraOptions
+  );
+
+  /*
+   * If the retry is STILL unauthorized, don't retry
+   * infinitely. The new token itself is not working.
+   */
+  if (
+    result.error &&
+    (
+      result.error.status === 401 ||
+      result.error.status === 403
+    )
+  ) {
+    api.dispatch(sessionCleared());
   }
 
   return result;
@@ -75,14 +217,24 @@ const baseQueryWithReauth: BaseQueryFn<string | FetchArgs, unknown, FetchBaseQue
 
 export const baseApi = createApi({
   reducerPath: 'api',
+
   baseQuery: baseQueryWithReauth,
-  tagTypes: ['Coupon', 'CouponList', 'Category', 'Brand', 'CurrentUser', 'CouponRequest', 'Notification', 'CommunityMessage'],
-  // Keep unused data for 5 minutes — the default 60s means navigating Browse Deals → Dashboard →
-  // Browse Deals throws away the coupon list and refetches from scratch. At 5 minutes, coming back
-  // within a session is instant (data is still in the Redux store). Polling overrides this for live
-  // views (requests, payments, notifications) that need fresh data regardless.
+
+  tagTypes: [
+    'Coupon',
+    'CouponList',
+    'Category',
+    'Brand',
+    'CurrentUser',
+    'CouponRequest',
+    'Notification',
+    'CommunityMessage',
+  ],
+
   keepUnusedDataFor: 300,
+
   refetchOnFocus: true,
   refetchOnReconnect: true,
+
   endpoints: () => ({}),
 });
